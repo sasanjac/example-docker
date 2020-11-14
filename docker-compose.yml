@@ -1,0 +1,504 @@
+version: "3.7"
+
+secrets:
+  cloudflare_api_key:
+    file: ${SECRETSDIR}/cloudflare_api_key
+  cloudflare_email:
+    file: ${SECRETSDIR}/cloudflare_email
+  authelia_jwt_secret:
+    file: ${SECRETSDIR}/authelia_jwt_secret
+  authelia_session_secret:
+    file: ${SECRETSDIR}/authelia_session_secret
+
+services:
+
+  cloudflare: # Cloudflare DynDNS (Nur notwendig, wenn Dienste aus dem Internet zugänglich sein sollen)
+    image: oznu/cloudflare-ddns:aarch64
+    container_name: cloudflare
+    environment:
+      API_KEY_FILE: /run/secrets/cloudflare_api_key
+      ZONE: ${DOMAINNAME}
+    networks:
+      - default
+    secrets:
+      - cloudflare_api_key
+    restart: unless-stopped
+
+  netatalk: # Dateifreigabe über Apple File Protocol/Timemachine
+    image: julienfouilhe/docker-netatalk-armhf:latest
+    container_name: netatalk
+    ports:
+      - 548:548
+    networks:
+      - default
+    volumes:
+      - ${CONFIGDIR}/netatalk/afp.conf:/etc/afp.conf:rw
+      - ${DATADIR}:/media/share
+      - ${MEDIADIR}:/media/media
+      - ${BACKUPDIR}:/media/timemachine
+    environment:
+      AFP_USER: ${AFP_USER}
+      AFP_PASSWORD: ${AFP_PASSWORD}
+      AFP_UID: ${PUID}
+      AFP_GID: ${PGID}
+    restart: unless-stopped
+  
+  samba: # Dateifreigabe über Samba
+    image: dperson/samba
+    container_name: samba
+    environment:
+      TZ: $TZ}
+      NMBD: "True"
+      USERID: ${PUID}
+      GROUPID: ${PGID}
+      USER: "user;passwort"
+      USER2: "user2;passwort"
+      SHARE: "Musik;/media/Music"
+      SHARE2: "Bücher;/media/Books"
+      SHARE3: "Hörbücher;/media/Audio Books"
+      SHARE4: "Serien;/media/Shows"
+      SHARE5: "Filme;/media/Movies"
+      SHARE6: "Bilder;/media/Pictures;yes;no;no;user,user2"
+      SHARE7: "Dokumente;/media/Documents;yes;no;no;user,user2"
+    networks:
+      - default
+    ports:
+      - target: 137
+        published: 137
+        protocol: udp
+        mode: host
+      - target: 138
+        published: 138
+        protocol: udp
+        mode: host
+      - target: 139
+        published: 139
+        protocol: tcp
+        mode: host
+      - target: 445
+        published: 445
+        protocol: tcp
+        mode: host
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    volumes:
+      - ${MEDIADIR}:/media
+
+  traefik: # Reverse Proxy (Nur notwendig, wenn Dienste aus dem Internet zugänglich sein sollen; eigene Domain notwendig)
+    image: traefik:latest
+    container_name: traefik
+    domainname: ${DOMAINNAME}
+    command: # CLI arguments
+      - --global.checkNewVersion=true
+      - --global.sendAnonymousUsage=true
+      - --entryPoints.http.address=:80
+      - --entryPoints.https.address=:443
+        # Allow these IPs to set the X-Forwarded-* headers - Cloudflare IPs: https://www.cloudflare.com/ips/
+      - --entrypoints.https.forwardedHeaders.trustedIPs=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/12,172.64.0.0/13,131.0.72.0/22
+      - --entryPoints.traefik.address=:8080
+      - --api=true
+      #      - --api.insecure=true
+      # - --serversTransport.insecureSkipVerify=true
+      - --log=true
+      - --log.level=DEBUG # (Default: error) DEBUG, INFO, WARN, ERROR, FATAL, PANIC
+      - --accessLog=true
+      - --accessLog.filePath=/var/log/docker/traefik.log
+      - --accessLog.bufferingSize=100 # Configuring a buffer of 100 lines
+      - --accessLog.filters.statusCodes=400-499
+      - --providers.docker=true
+      - --providers.docker.endpoint=tcp://socket-proxy:2375
+      - --providers.docker.defaultrule=Host(`{{ index .Labels "com.docker.compose.service" }}.$DOMAINNAME`)
+      - --providers.docker.exposedByDefault=false
+      - --providers.docker.network=proxy
+      - --providers.docker.swarmMode=false
+      - --providers.file.directory=/rules # Load dynamic configuration from one or more .toml or .yml files in a directory.
+      #      - --providers.file.filename=/path/to/file # Load dynamic configuration from a file.
+      - --providers.file.watch=true # Only works on top level files in the rules folder
+      #      - --certificatesResolvers.dns-cloudflare.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory # LetsEncrypt Staging Server - uncomment when testing
+      - --certificatesResolvers.dns-cloudflare.acme.email=/run/secrets/cloudflare_email
+      - --certificatesResolvers.dns-cloudflare.acme.storage=/acme.json
+      - --certificatesResolvers.dns-cloudflare.acme.dnsChallenge.provider=cloudflare
+    networks:
+      - proxy
+      - socket_proxy
+    depends_on:
+      - socket-proxy
+      # - authelia
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+    environment:
+      TZ: ${TZ}
+      CF_API_EMAIL_FILE: /run/secrets/cloudflare_email
+      CF_API_KEY_FILE: /run/secrets/cloudflare_api_key
+    secrets:
+      - cloudflare_email
+      - cloudflare_api_key
+    labels:
+      - "traefik.enable=true"
+      # HTTP-to-HTTPS Redirect
+      - "traefik.http.routers.http-catchall.entrypoints=http"
+      - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      # HTTP Routers
+      - "traefik.http.routers.traefik-rtr.entrypoints=https"
+      - "traefik.http.routers.traefik-rtr.rule=Host(`traefik.$DOMAINNAME`)"
+      - "traefik.http.routers.traefik-rtr.tls=true"
+      #        - "traefik.http.routers.traefik-rtr.tls.certresolver=dns-cloudflare" # Comment out this line after first run of traefik to force the use of wildcard certs
+      - "traefik.http.routers.traefik-rtr.tls.domains[0].main=$DOMAINNAME"
+      - "traefik.http.routers.traefik-rtr.tls.domains[0].sans=*.$DOMAINNAME"
+      ## Middlewares
+      - "traefik.http.routers.traefik-rtr.middlewares=chain-authelia@file"
+      - "traefik.http.middlewares.traefik-headers.headers.accesscontrolallowmethods=GET, OPTIONS, PUT"
+      - "traefik.http.middlewares.traefik-headers.headers.accesscontrolalloworiginlist=https://$DOMAINNAME"
+      - "traefik.http.middlewares.traefik-headers.headers.accesscontrolmaxage=100"
+      - "traefik.http.middlewares.traefik-headers.headers.addvaryheader=true"
+      - "traefik.http.middlewares.traefik-headers.headers.allowedhosts=traefik.$DOMAINNAME"
+      - "traefik.http.middlewares.traefik-headers.headers.hostsproxyheaders=X-Forwarded-Host"
+      - "traefik.http.middlewares.traefik-headers.headers.sslredirect=true"
+      - "traefik.http.middlewares.traefik-headers.headers.sslhost=traefik.$DOMAINNAME"
+      - "traefik.http.middlewares.traefik-headers.headers.sslforcehost=true"
+      - "traefik.http.middlewares.traefik-headers.headers.sslproxyheaders.X-Forwarded-Proto=https"
+      - "traefik.http.middlewares.traefik-headers.headers.stsseconds=63072000"
+      - "traefik.http.middlewares.traefik-headers.headers.stsincludesubdomains=true"
+      - "traefik.http.middlewares.traefik-headers.headers.stspreload=true"
+      - "traefik.http.middlewares.traefik-headers.headers.forcestsheader=true"
+      - "traefik.http.middlewares.traefik-headers.headers.framedeny=true"
+      - "traefik.http.middlewares.traefik-headers.headers.contenttypenosniff=true"
+      - "traefik.http.middlewares.traefik-headers.headers.browserxssfilter=true"
+      - "traefik.http.middlewares.traefik-headers.headers.referrerpolicy=same-origin"
+      - "traefik.http.middlewares.traefik-headers.headers.featurepolicy=camera 'none'; geolocation 'none'; microphone 'none'; payment 'none'; usb 'none'; vr 'none';"
+      - "traefik.http.middlewares.traefik-headers.headers.customresponseheaders.X-Robots-Tag=none,noarchive,nosnippet,notranslate,noimageindex,"
+      ## Services - API
+      - "traefik.http.routers.traefik-rtr.service=api@internal"
+      ## Exclude from Watchtower
+      - "com.centurylinklabs.watchtower.enable=false"
+    volumes:
+      - ${CONFIGDIR}/traefik/rules:/rules # file provider directory
+      - ${CONFIGDIR}/traefik/acme/acme.json:/acme.json # cert location - you must touch this file and change permissions to 600
+      - ${CONFIGDIR}/traefik/traefik.log:/var/log/docker/traefik.log # for fail2ban - make sure to touch file before starting container
+    restart: always
+
+  pihole: # DNS Server & Adblocker
+    container_name: pihole
+    image: pihole/pihole:latest
+    ports:
+      - 53:53/tcp
+      - 53:53/udp
+      - 67:67/udp
+      - 8053:80/tcp
+    environment:
+      TZ: ${TZ}
+      WEBPASSWORD: ${PIHOLE_PASSWORD}
+    networks:
+      - proxy
+    dns:
+      - 127.0.0.1
+      - 1.1.1.1
+    volumes:
+      - ${CONFIGDIR}/pihole/:/etc/pihole/
+      - ${CONFIGDIR}/dnsmasq.d/:/etc/dnsmasq.d/
+    cap_add:
+      - NET_ADMIN
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pihole-rtr.rule=Host(`pi.hole`)"
+      - "traefik.http.middlewares.pihole-addprefix.addprefix.prefix=/admin"
+      - "traefik.http.routers.pihole-rtr.entrypoints=http"
+      - "traefik.http.routers.pihole-rtr.priority=24"
+      - "traefik.http.routers.pihole-rtr.middlewares=pihole-addprefix@docker"
+      - "traefik.http.routers.pihole-rtr.service=pihole-svc"
+      - "traefik.http.services.pihole-svc.loadbalancer.server.port=80"
+
+  socket-proxy: # Proxy für den Docker Socket für andere Dienste
+    container_name: socket-proxy
+    image: iamthefij/docker-socket-proxy:latest
+    restart: always
+    networks:
+      - socket_proxy
+    privileged: true
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    environment:
+      - LOG_LEVEL=info # debug,info,notice,warning,err,crit,alert,emerg
+      ## Variables match the URL prefix (i.e. AUTH blocks access to /auth/* parts of the API, etc.).
+      # 0 to revoke access.
+      # 1 to grant access.
+      ## Granted by Default
+      - EVENTS=1
+      - PING=1
+      - VERSION=1
+      ## Revoked by Default
+      # Security critical
+      - AUTH=0
+      - SECRETS=0
+      - POST=1 # Watchtower
+      # Not always needed
+      - BUILD=0
+      - COMMIT=0
+      - CONFIGS=0
+      - CONTAINERS=1 # Traefik, Portainer, etc.
+      - DISTRIBUTION=0
+      - EXEC=0
+      - IMAGES=1 # Portainer, Watchtower
+      - INFO=1 # Portainer
+      - NETWORKS=1 # Portainer, Watchtower
+      - NODES=0
+      - PLUGINS=0
+      - SERVICES=1 # Portainer
+      - SESSION=0
+      - SWARM=0
+      - SYSTEM=0
+      - TASKS=1 # Portainer
+      - VOLUMES=1 # Portainer
+
+  portainer: # Container Status
+    container_name: portainer
+    image: portainer/portainer:latest
+    restart: unless-stopped
+    networks:
+      - proxy
+      - socket_proxy
+    depends_on:
+      - socket-proxy
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${CONFIGDIR}/portainer/data:/data 
+    environment:
+      TZ: ${TZ}
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.portainer-rtr.entrypoints=https"
+      - "traefik.http.routers.portainer-rtr.rule=Host(`portainer.$DOMAINNAME`)"
+      - "traefik.http.routers.portainer-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.portainer-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.portainer-rtr.service=portainer-svc"
+      - "traefik.http.services.portainer-svc.loadbalancer.server.port=9000"
+
+  authelia: # Authentifizierung
+    container_name: authelia
+    image: authelia/authelia:latest
+    restart: always
+    networks:
+      - proxy
+      - db
+    depends_on:
+     - redis
+    volumes:
+      - ${CONFIGDIR}/authelia:/config
+    environment:
+      TZ: ${TZ}
+      AUTHELIA_JWT_SECRET_FILE: /run/secrets/authelia_jwt_secret
+      AUTHELIA_SESSION_SECRET_FILE: /run/secrets/authelia_session_secret
+    secrets:
+      - authelia_jwt_secret
+      - authelia_session_secret
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.authelia-rtr.entrypoints=https"
+      - "traefik.http.routers.authelia-rtr.rule=Host(`authelia.$DOMAINNAME`)"
+      - "traefik.http.routers.authelia-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.authelia-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.authelia-rtr.service=authelia-svc"
+      - "traefik.http.services.authelia-svc.loadbalancer.server.port=9091"
+
+  redis: # Für Authelia
+    image: redis:latest
+    container_name: redis
+    restart: unless-stopped
+    volumes:
+      - ${CONFIGDIR}/redis:/data
+    networks:
+      - db
+
+  dozzle: # Docker logs
+    image: amir20/dozzle:latest
+    container_name: dozzle
+    restart: unless-stopped
+    networks:
+      - proxy
+      - socket_proxy
+    depends_on:
+      - socket-proxy
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DOZZLE_LEVEL: info
+      DOZZLE_TAILSIZE: 300
+      DOZZLE_FILTER: "status=running"
+      # DOZZLE_FILTER: "label=log_me" # limits logs displayed to containers with this label
+      DOCKER_HOST: tcp://socket-proxy:2375
+    # volumes:
+    #  - /var/run/docker.sock:/var/run/docker.sock # Use Docker Socket Proxy instead for improved security
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.dozzle-rtr.entrypoints=https"
+      - "traefik.http.routers.dozzle-rtr.rule=Host(`dozzle.$DOMAINNAME`)"
+      - "traefik.http.routers.dozzle-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.dozzle-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.dozzle-rtr.service=dozzle-svc"
+      - "traefik.http.services.dozzle-svc.loadbalancer.server.port=8080"
+
+  openvpn: # VPN Verbindung, VPN Account notwendig
+    image: qmcgaw/private-internet-access:latest
+    container_name: openvpn
+    networks:
+      - proxy
+    devices:
+      - /dev/net/tun
+    init: true
+    ports:
+      - 6881:6881/udp
+      - 6881:6881
+      - 8168:8168
+    environment:
+      USER: ${VPN_USERNAME}
+      PASSWORD: ${VPN_PASSWORD}
+      REGION: Switzerland
+      PIA_ENCRYPTION: strong
+      BLOCK_MALICIOUS: "on"
+    dns:
+      - 209.222.18.222
+      - 209.222.18.218
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+
+  plex: # Mediaserver
+    image: linuxserver/plex:latest
+    container_name: plex
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+      VERSION: latest
+      HOSTNAME: Plex Media Server
+    restart: unless-stopped
+    ports:
+      - 32400:32400/tcp
+    volumes:
+      - ${MEDIADIR}/Music:/music
+      - ${MEDIADIR}/Pictures:/picture
+      - ${MEDIADIR}/Audio Books:/audiobooks
+      - ${MEDIADIR}/Shows:/shows
+      - ${MEDIADIR}/Movies:/movies
+      - ${MEDIADIR}/.plex/config:/config
+      - ${MEDIADIR}/.plex/transcode:/transcode
+    networks:
+      - proxy
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.plex-rtr.entrypoints=https"
+      - "traefik.http.routers.plex-rtr.rule=Host(`plex.$DOMAINNAME`)"
+      - "traefik.http.routers.plex-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.plex-rtr.middlewares=chain-no-auth@file"
+      ## HTTP Services
+      - "traefik.http.routers.plex-rtr.service=plex-svc"
+      - "traefik.http.services.plex-svc.loadbalancer.server.port=32400"
+
+  whoami: # Beispiel zum Einbinden von Containern, die sich durch den VPN verbinden
+    image: whoami:latest
+    container_name: whoami
+    privileged: true
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+    depends_on:
+      - openvpn
+    network_mode: "service:openvpn"
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers
+      - "traefik.http.routers.whoami-rtr.entrypoints=https"
+      - "traefik.http.routers.whoami-rtr.rule=Host(`whoami.$DOMAINNAME`)"
+      - "traefik.http.routers.whoami-rtr.tls=true"
+      ## Middlewares
+      - "traefik.http.routers.whoami-rtr.middlewares=chain-authelia@file"
+      ## HTTP Services
+      - "traefik.http.routers.whoami-rtr.service=whoami-svc"
+      - "traefik.http.services.whoami-svc.loadbalancer.server.port=8168"
+
+  watchtower: # Automatische Docker Image Updates
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    networks:
+      - socket_proxy
+    depends_on:
+      - socket-proxy
+    environment:
+      TZ: ${TZ}
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_REMOVE_VOLUMES: "true"
+      WATCHTOWER_INCLUDE_STOPPED: "true"
+      WATCHTOWER_NO_STARTUP_MESSAGE: "true"
+      WATCHTOWER_SCHEDULE: "0 30 12 * * *" # Everyday at 12:30
+      WATCHTOWER_NOTIFICATIONS: shoutrrr
+      WATCHTOWER_NOTIFICATION_URL: "telegram://${TGRAM_BOT_TOKEN}@telegram?channels=${TGRAM_CHAT_ID}"
+      WATCHTOWER_NOTIFICATIONS_LEVEL: info
+      DOCKER_HOST: tcp://socket-proxy:2375
+      DOCKER_API_VERSION: "1.40"
+
+  dockergc: # Docker Cleanup
+    image: rasaro/docker-gc-cron:latest
+    container_name: docker-gc
+    restart: unless-stopped
+    networks:
+      - socket_proxy
+    depends_on:
+      - socket-proxy
+    volumes:
+      - ${CONFIGDIR}/docker-gc/docker-gc-exclude:/etc/docker-gc-exclude
+    environment:
+      CRON: 0 0 0 * * ? # Everyday at midnight. Previously 0 0 * * *
+      FORCE_IMAGE_REMOVAL: 1
+      FORCE_CONTAINER_REMOVAL: 0
+      GRACE_PERIOD_SECONDS: 604800
+      DRY_RUN: 0
+      CLEAN_UP_VOLUMES: 1
+      TZ: ${TZ}
+      DOCKER_HOST: tcp://socket-proxy:2375
+
+
+networks:
+  proxy:
+    external:
+      name: proxy
+  default:
+    driver: bridge
+    name: default
+  db:
+    driver: bridge
+    name: db
+  socket_proxy:
+    external:
+      name: socket_proxy
